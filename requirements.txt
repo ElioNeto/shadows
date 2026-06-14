@@ -1,0 +1,16 @@
+# Shadows — Python dependencies
+#
+# System dependencies (Ubuntu/Debian):
+#   sudo apt install python3-pyqt5 python3-psutil python3-cryptography python3-dbus
+#   sudo apt install libdbus-1-dev libdbus-glib-1-dev xdotool
+#
+# Or use the automated script:
+#   sudo bash scripts/setup-system-deps.sh
+#
+# Then install Python packages:
+#   pip install -r requirements.txt
+
+PyQt5>=5.15
+psutil>=5.8
+cryptography>=3.4
+dbus-python>=1.2
