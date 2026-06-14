@@ -78,6 +78,7 @@ from .ai import (
     Translator,
     _DEFAULT_OLLAMA_URL,
     _DEFAULT_OPENAI_MODEL,
+    _DEFAULT_OPENAI_BASE_URL,
     _DEFAULT_GEMINI_MODEL,
 )
 from .detector import ScreenShareDetector
@@ -267,7 +268,7 @@ class NoteEditor(QWidget):
         super().__init__(parent)
         self._current_note: Optional[Note] = None
         self._modified = False
-        self._ai_settings = AISettings.load()
+        self._ai_settings = AISettings.load_or_detect()
         self._translator: Optional[Translator] = None
         self._translated_content: Optional[str] = None
         self._build_ui()
@@ -589,7 +590,7 @@ class MainWindow(QMainWindow):
         self._detector = detector
         self._notes: list[Note] = []
         self._sharing = False
-        self._ai_settings = AISettings.load()
+        self._ai_settings = AISettings.load_or_detect()
         self._ai_visible = self._ai_settings.show_ai_panel_on_start
 
         self._build_ui()
@@ -1706,7 +1707,7 @@ class AISettingsDialog(QDialog):
         layout.addWidget(self._ollama_group)
 
         # ── OpenAI settings ───────────────────────────────────────
-        self._openai_group = QGroupBox("OpenAI")
+        self._openai_group = QGroupBox("OpenAI / OpenRouter")
         openai_layout = QFormLayout(self._openai_group)
         openai_layout.setSpacing(8)
 
@@ -1715,9 +1716,22 @@ class AISettingsDialog(QDialog):
         self._openai_key.setEchoMode(QLineEdit.Password)
         openai_layout.addRow("API Key:", self._openai_key)
 
+        self._openai_base_url = QLineEdit(self._settings.openai_base_url)
+        self._openai_base_url.setPlaceholderText("https://api.openai.com/v1")
+        openai_layout.addRow("URL Base:", self._openai_base_url)
+
         self._openai_model = QLineEdit(self._settings.openai_model)
         self._openai_model.setPlaceholderText("gpt-4o-mini")
         openai_layout.addRow("Modelo:", self._openai_model)
+
+        openai_help = QLabel(
+            "💡 Para usar OpenRouter: cole a chave da OpenRouter, "
+            "use URL https://openrouter.ai/api/v1\n"
+            "e modelo como 'qwen/qwen3.5-flash' ou 'openai/gpt-4o-mini'"
+        )
+        openai_help.setStyleSheet("color: #888; font-size: 11px; font-style: italic;")
+        openai_help.setWordWrap(True)
+        openai_layout.addRow("", openai_help)
 
         layout.addWidget(self._openai_group)
 
@@ -1756,6 +1770,21 @@ class AISettingsDialog(QDialog):
 
         # ── Buttons ───────────────────────────────────────────────
         btn_layout = QHBoxLayout()
+
+        self._detect_env_btn = QPushButton("🔍  Detectar do Ambiente")
+        self._detect_env_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #a0a0b0;
+                border: 1px solid #2a2a4a;
+            }
+            QPushButton:hover {
+                border: 1px solid #4caf50;
+                color: #4caf50;
+            }
+        """)
+        self._detect_env_btn.clicked.connect(self._on_detect_env)
+        btn_layout.addWidget(self._detect_env_btn)
 
         btn_layout.addStretch()
 
@@ -1864,6 +1893,47 @@ class AISettingsDialog(QDialog):
             }
         """)
 
+    def _on_detect_env(self) -> None:
+        """Detect settings from environment variables and fill the form."""
+        env_settings = AISettings.detect_from_env()
+
+        # Update provider combo
+        provider_idx = self._provider_combo.findData(env_settings.provider.value)
+        if provider_idx >= 0:
+            self._provider_combo.setCurrentIndex(provider_idx)
+
+        # Update OpenAI fields
+        if env_settings.openai_api_key:
+            self._openai_key.setText(env_settings.openai_api_key)
+            self._provider_combo.setCurrentIndex(
+                self._provider_combo.findData(AIProvider.OPENAI.value)
+            )
+        if env_settings.openai_base_url != _DEFAULT_OPENAI_BASE_URL:
+            self._openai_base_url.setText(env_settings.openai_base_url)
+        self._openai_model.setText(env_settings.openai_model)
+
+        # Update Gemini fields
+        if env_settings.gemini_api_key:
+            self._gemini_key.setText(env_settings.gemini_api_key)
+            if not env_settings.openai_api_key:
+                self._provider_combo.setCurrentIndex(
+                    self._provider_combo.findData(AIProvider.GEMINI.value)
+                )
+
+        # Update language combo
+        lang_idx = self._target_lang_combo.findData(env_settings.default_target_lang)
+        if lang_idx >= 0:
+            self._target_lang_combo.setCurrentIndex(lang_idx)
+
+        self._on_provider_changed()
+        QMessageBox.information(
+            self, "Ambiente Detectado",
+            f"Provedor: {env_settings.provider.value.upper()}\n"
+            f"Modelo: {env_settings.openai_model}\n"
+            f"URL Base: {env_settings.openai_base_url}\n\n"
+            "Revise as configurações e clique em Salvar."
+        )
+
     def _collect_settings(self) -> AISettings:
         return AISettings(
             provider=AIProvider(self._provider_combo.currentData()),
@@ -1871,6 +1941,7 @@ class AISettingsDialog(QDialog):
             ollama_model=self._ollama_model.text().strip() or _DEFAULT_OLLAMA_MODEL,
             openai_api_key=self._openai_key.text().strip(),
             openai_model=self._openai_model.text().strip() or _DEFAULT_OPENAI_MODEL,
+            openai_base_url=self._openai_base_url.text().strip() or _DEFAULT_OPENAI_BASE_URL,
             gemini_api_key=self._gemini_key.text().strip(),
             gemini_model=self._gemini_model.text().strip() or _DEFAULT_GEMINI_MODEL,
             default_target_lang=self._target_lang_combo.currentData(),

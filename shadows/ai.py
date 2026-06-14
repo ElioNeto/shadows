@@ -36,6 +36,7 @@ _SETTINGS_FILE = Path.home() / ".shadows" / "settings.json"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_OLLAMA_MODEL = "llama3.2"
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_GEMINI_MODEL = "gemini-2.0-flash-lite"
 
 # Languages supported by the translation feature
@@ -86,6 +87,7 @@ class Settings:
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = _DEFAULT_OPENAI_MODEL
+    openai_base_url: str = _DEFAULT_OPENAI_BASE_URL
 
     # Gemini
     gemini_api_key: str = ""
@@ -98,18 +100,79 @@ class Settings:
     # UI
     show_ai_panel_on_start: bool = True
 
+    # ── environment detection ─────────────────────────────────────
+
+    @classmethod
+    def detect_from_env(cls) -> Settings:
+        """Detect provider settings from environment variables.
+
+        Reads the same variables the opencode tool uses, so Shadows
+        automatically inherits the user's existing AI configuration.
+
+        Priority: ``OPENAI_BASE_URL`` > ``OPENAI_API_KEY`` > ``OPENAI_MODEL``.
+        Falls back to ``GOOGLE_API_KEY`` or Ollama if nothing is set.
+        """
+        s = cls()
+
+        # --- OpenAI / OpenRouter ---
+        env_key = os.environ.get("OPENAI_API_KEY", "")
+        env_model = os.environ.get("OPENAI_MODEL", "")
+        env_base_url = os.environ.get("OPENAI_BASE_URL", "")
+
+        if env_key:
+            s.openai_api_key = env_key
+            s.provider = AIProvider.OPENAI
+        if env_model:
+            s.openai_model = env_model
+        if env_base_url:
+            s.openai_base_url = env_base_url
+
+        # --- Gemini ---
+        env_gemini_key = os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+        if env_gemini_key and not env_key:
+            s.gemini_api_key = env_gemini_key
+            s.provider = AIProvider.GEMINI
+
+        # --- OpenRouter specific ---
+        if "openrouter" in s.openai_base_url.lower():
+            # Default to a good model if none was explicitly set via env
+            if not env_model:
+                s.openai_model = "openai/gpt-4o-mini"
+
+        logger.info(
+            "AI settings detected from environment: provider=%s model=%s base_url=%s",
+            s.provider.value, s.openai_model,
+            s.openai_base_url if s.provider == AIProvider.OPENAI else "N/A",
+        )
+        return s
+
+    @classmethod
+    def load_or_detect(cls) -> Settings:
+        """Load saved settings, or detect from environment if none exist."""
+        if _SETTINGS_FILE.exists():
+            s = cls.load()
+            # If saved settings exist but have no API key, try env as fallback
+            if s.provider == AIProvider.OPENAI and not s.openai_api_key:
+                env = cls.detect_from_env()
+                if env.openai_api_key:
+                    s.openai_api_key = env.openai_api_key
+                    s.openai_base_url = env.openai_base_url
+                    s.openai_model = env.openai_model
+            return s
+        return cls.detect_from_env()
+
     # ── serialisation ─────────────────────────────────────────────
 
     def save(self) -> None:
         """Persist settings to disk."""
         _SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Mask keys in logs but store them
         data = {
             "provider": self.provider.value,
             "ollama_url": self.ollama_url,
             "ollama_model": self.ollama_model,
             "openai_api_key": self.openai_api_key,
             "openai_model": self.openai_model,
+            "openai_base_url": self.openai_base_url,
             "gemini_api_key": self.gemini_api_key,
             "gemini_model": self.gemini_model,
             "default_source_lang": self.default_source_lang,
@@ -133,6 +196,7 @@ class Settings:
                 ollama_model=data.get("ollama_model", _DEFAULT_OLLAMA_MODEL),
                 openai_api_key=data.get("openai_api_key", ""),
                 openai_model=data.get("openai_model", _DEFAULT_OPENAI_MODEL),
+                openai_base_url=data.get("openai_base_url", _DEFAULT_OPENAI_BASE_URL),
                 gemini_api_key=data.get("gemini_api_key", ""),
                 gemini_model=data.get("gemini_model", _DEFAULT_GEMINI_MODEL),
                 default_source_lang=data.get("default_source_lang", "pt-BR"),
@@ -201,18 +265,24 @@ def _call_openai(
     model: str,
     messages: list[dict],
     *,
+    base_url: str = _DEFAULT_OPENAI_BASE_URL,
     timeout: int = 60,
 ) -> str:
-    """Call OpenAI's chat completion endpoint.
+    """Call an OpenAI-compatible chat completion endpoint.
+
+    Supports any OpenAI-compatible API including OpenRouter, Together,
+    and local proxies (e.g. LiteLLM).
 
     Parameters
     ----------
     api_key : str
-        OpenAI API key.
+        API key for the provider.
     model : str
-        Model name (e.g. ``gpt-4o-mini``).
+        Model name (e.g. ``gpt-4o-mini``, ``qwen/qwen3.5-flash``).
     messages : list[dict]
         Chat messages in OpenAI format.
+    base_url : str
+        Base URL of the API endpoint (default ``https://api.openai.com/v1``).
     timeout : int
         Request timeout in seconds.
 
@@ -231,24 +301,34 @@ def _call_openai(
         "model": model,
         "messages": messages,
     }
+
+    # Ensure the URL ends with /chat/completions
+    base = base_url.rstrip("/")
+    if not base.endswith("/chat/completions"):
+        if base.endswith("/v1"):
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+    else:
+        url = base
+
     try:
         with httpx.Client(timeout=timeout) as client:
-            resp = client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
+            resp = client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"].strip()
     except httpx.HTTPStatusError as exc:
-        logger.error("OpenAI HTTP error: %s", exc)
-        raise RuntimeError(f"OpenAI retornou erro {exc.response.status_code}") from exc
-    except httpx.RequestError as exc:
-        logger.error("OpenAI connection error: %s", exc)
+        logger.error("OpenAI API HTTP error: %s", exc)
         raise RuntimeError(
-            "Não foi possível conectar à API OpenAI. "
-            "Verifique sua conexão com a internet."
+            f"API retornou erro {exc.response.status_code} — "
+            f"verifique a chave e a URL base"
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.error("OpenAI API connection error: %s", exc)
+        raise RuntimeError(
+            "Não foi possível conectar à API. "
+            "Verifique sua conexão com a internet e a URL base."
         ) from exc
 
 
@@ -359,7 +439,10 @@ def _chat_completion(
     if provider == AIProvider.OLLAMA:
         return _call_ollama(settings.ollama_url, settings.ollama_model, messages, timeout=timeout)
     elif provider == AIProvider.OPENAI:
-        return _call_openai(settings.openai_api_key, settings.openai_model, messages, timeout=timeout)
+        return _call_openai(
+            settings.openai_api_key, settings.openai_model, messages,
+            base_url=settings.openai_base_url, timeout=timeout,
+        )
     elif provider == AIProvider.GEMINI:
         return _call_gemini(settings.gemini_api_key, settings.gemini_model, messages, timeout=timeout)
     else:
