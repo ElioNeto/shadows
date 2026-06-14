@@ -76,10 +76,15 @@ from .ai import (
     Settings as AISettings,
     SUPPORTED_LANGUAGES,
     Translator,
+    get_free_models,
+    get_preferred_free_model,
     _DEFAULT_OLLAMA_URL,
     _DEFAULT_OPENAI_MODEL,
     _DEFAULT_OPENAI_BASE_URL,
     _DEFAULT_GEMINI_MODEL,
+    _OPENCODE_FREE_MODELS,
+    _OPENCODE_DEFAULT_MODEL,
+    _OPENCODE_GATEWAY_URL,
 )
 from .detector import ScreenShareDetector
 from .overlay import PrivacyOverlay
@@ -1660,6 +1665,22 @@ class AISettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
+        # ── Free model quick-select ──────────────────────────────
+        free_header = QLabel(
+            "✨  Modelos gratuitos disponíveis: "
+            + ", ".join(get_free_models(self._settings.provider)[:4])
+        )
+        free_header.setStyleSheet("""
+            color: #4caf50;
+            font-size: 12px;
+            padding: 8px 12px;
+            background-color: #1a3a1a;
+            border: 1px solid #2d4a2e;
+            border-radius: 6px;
+        """)
+        free_header.setWordWrap(True)
+        layout.addWidget(free_header)
+
         # ── Provider selection ────────────────────────────────────
         provider_group = QGroupBox("Provedor")
         provider_layout = QVBoxLayout(provider_group)
@@ -1734,6 +1755,61 @@ class AISettingsDialog(QDialog):
         openai_layout.addRow("", openai_help)
 
         layout.addWidget(self._openai_group)
+
+        # ── OpenCode settings ─────────────────────────────────────
+        self._opencode_group = QGroupBox("OpenCode (Gratuito)")
+        opencode_layout = QFormLayout(self._opencode_group)
+        opencode_layout.setSpacing(8)
+
+        self._opencode_key = QLineEdit(self._settings.opencode_api_key)
+        self._opencode_key.setPlaceholderText("TEAMCODE_API_KEY")
+        self._opencode_key.setEchoMode(QLineEdit.Password)
+        opencode_layout.addRow("API Key:", self._opencode_key)
+
+        self._opencode_model = QComboBox()
+        for m in _OPENCODE_FREE_MODELS:
+            self._opencode_model.addItem(m, m)
+        # Add default model if not in free list
+        if _OPENCODE_DEFAULT_MODEL not in _OPENCODE_FREE_MODELS:
+            self._opencode_model.addItem(
+                _OPENCODE_DEFAULT_MODEL + " (padrão)", _OPENCODE_DEFAULT_MODEL
+            )
+        idx = self._opencode_model.findData(self._settings.opencode_model)
+        if idx >= 0:
+            self._opencode_model.setCurrentIndex(idx)
+        self._opencode_model.setStyleSheet("""
+            QComboBox {
+                background-color: #16213e;
+                color: #ffffff;
+                border: 1px solid #2a2a4a;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 13px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background: transparent;
+            }
+            QComboBox:hover {
+                border: 1px solid #e94560;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #16213e;
+                color: #ffffff;
+                selection-background-color: #e94560;
+            }
+        """)
+        opencode_layout.addRow("Modelo gratuito:", self._opencode_model)
+
+        opencode_help = QLabel(
+            "💡 Modelos gratuitos do ecossistema OpenCode. "
+            "Requer a chave TEAMCODE_API_KEY configurada no ambiente."
+        )
+        opencode_help.setStyleSheet("color: #888; font-size: 11px; font-style: italic;")
+        opencode_help.setWordWrap(True)
+        opencode_layout.addRow("", opencode_help)
+
+        layout.addWidget(self._opencode_group)
 
         # ── Gemini settings ───────────────────────────────────────
         self._gemini_group = QGroupBox("Google Gemini")
@@ -1841,6 +1917,7 @@ class AISettingsDialog(QDialog):
         provider = self._provider_combo.currentData()
         self._ollama_group.setVisible(provider == AIProvider.OLLAMA.value)
         self._openai_group.setVisible(provider == AIProvider.OPENAI.value)
+        self._opencode_group.setVisible(provider == AIProvider.OPENCODE.value)
         self._gemini_group.setVisible(provider == AIProvider.GEMINI.value)
 
     def _on_test_connection(self) -> None:
@@ -1912,10 +1989,22 @@ class AISettingsDialog(QDialog):
             self._openai_base_url.setText(env_settings.openai_base_url)
         self._openai_model.setText(env_settings.openai_model)
 
+        # Update OpenCode fields
+        if env_settings.opencode_api_key:
+            self._opencode_key.setText(env_settings.opencode_api_key)
+            model_idx = self._opencode_model.findData(env_settings.opencode_model)
+            if model_idx >= 0:
+                self._opencode_model.setCurrentIndex(model_idx)
+            # Only switch to opencode if no other key is set
+            if not env_settings.openai_api_key and not env_settings.gemini_api_key:
+                self._provider_combo.setCurrentIndex(
+                    self._provider_combo.findData(AIProvider.OPENCODE.value)
+                )
+
         # Update Gemini fields
         if env_settings.gemini_api_key:
             self._gemini_key.setText(env_settings.gemini_api_key)
-            if not env_settings.openai_api_key:
+            if not env_settings.openai_api_key and not env_settings.opencode_api_key:
                 self._provider_combo.setCurrentIndex(
                     self._provider_combo.findData(AIProvider.GEMINI.value)
                 )
@@ -1944,6 +2033,9 @@ class AISettingsDialog(QDialog):
             openai_base_url=self._openai_base_url.text().strip() or _DEFAULT_OPENAI_BASE_URL,
             gemini_api_key=self._gemini_key.text().strip(),
             gemini_model=self._gemini_model.text().strip() or _DEFAULT_GEMINI_MODEL,
+            opencode_api_key=self._opencode_key.text().strip(),
+            opencode_model=self._opencode_model.currentData() or _OPENCODE_DEFAULT_MODEL,
+            opencode_gateway_url=_OPENCODE_GATEWAY_URL,
             default_target_lang=self._target_lang_combo.currentData(),
         )
 

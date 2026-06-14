@@ -39,6 +39,28 @@ _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 _DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_GEMINI_MODEL = "gemini-2.0-flash-lite"
 
+# OpenCode provider (uses the same credentials as the opencode tool)
+_OPENCODE_API_KEY_ENV = "TEAMCODE_API_KEY"
+_OPENCODE_GATEWAY_URL = "https://gateway.opencode.ai/v1/chat/completions"
+_OPENCODE_DEFAULT_MODEL = "opencode-go/deepseek-v4-flash"
+_OPENCODE_FREE_MODELS: list[str] = [
+    "opencode/deepseek-v4-flash-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/north-mini-code-free",
+    "opencode/mimo-v2.5-free",
+]
+
+# Free / cheap models available via OpenRouter
+_OPENROUTER_FREE_MODELS: list[str] = [
+    "google/gemini-2.5-flash",         # Free tier
+    "google/gemini-2.5-flash-lite",    # Free tier
+    "deepseek/deepseek-chat",          # Very cheap
+    "qwen/qwen3.5-flash-02-23",        # Cheap
+    "meta-llama/llama-4-scout",        # Free tier
+    "mistralai/mistral-small-3.1",     # Free tier
+    "nousresearch/hermes-3-llama-3.1-405b:free",  # Free
+]
+
 # Languages supported by the translation feature
 SUPPORTED_LANGUAGES: dict[str, str] = {
     "pt-BR": "Português (Brasil)",
@@ -66,6 +88,7 @@ class AIProvider(str, Enum):
     OLLAMA = "ollama"
     OPENAI = "openai"
     GEMINI = "gemini"
+    OPENCODE = "opencode"
 
 
 # ===================================================================
@@ -92,6 +115,11 @@ class Settings:
     # Gemini
     gemini_api_key: str = ""
     gemini_model: str = _DEFAULT_GEMINI_MODEL
+
+    # OpenCode (gratuito via opencode tool)
+    opencode_api_key: str = ""
+    opencode_model: str = _OPENCODE_DEFAULT_MODEL
+    opencode_gateway_url: str = _OPENCODE_GATEWAY_URL
 
     # Translation defaults
     default_source_lang: str = "pt-BR"
@@ -133,6 +161,22 @@ class Settings:
             s.gemini_api_key = env_gemini_key
             s.provider = AIProvider.GEMINI
 
+        # --- OpenCode (gratuito via opencode tool) ---
+        opencode_key = os.environ.get(_OPENCODE_API_KEY_ENV, "")
+        if opencode_key:
+            s.opencode_api_key = opencode_key
+            s.opencode_gateway_url = _OPENCODE_GATEWAY_URL
+            s.opencode_model = _OPENCODE_DEFAULT_MODEL
+            # Use OpenCode as primary if explicitly requested via env,
+            # or as fallback if no other key is available
+            if not env_key and not env_gemini_key:
+                s.provider = AIProvider.OPENCODE
+                logger.info("OpenCode provider selected (no other keys found)")
+            else:
+                logger.info(
+                    "OpenCode key found but other providers also available"
+                )
+
         # --- OpenRouter specific ---
         if "openrouter" in s.openai_base_url.lower():
             # Default to a good model if none was explicitly set via env
@@ -158,6 +202,14 @@ class Settings:
                     s.openai_api_key = env.openai_api_key
                     s.openai_base_url = env.openai_base_url
                     s.openai_model = env.openai_model
+            # If no provider configured but opencode key exists, use it
+            if s.provider == AIProvider.OLLAMA and not s.opencode_api_key:
+                env = cls.detect_from_env()
+                if env.opencode_api_key:
+                    s.opencode_api_key = env.opencode_api_key
+                    s.opencode_model = env.opencode_model
+                    s.opencode_gateway_url = env.opencode_gateway_url
+                    s.provider = AIProvider.OPENCODE
             return s
         return cls.detect_from_env()
 
@@ -175,6 +227,9 @@ class Settings:
             "openai_base_url": self.openai_base_url,
             "gemini_api_key": self.gemini_api_key,
             "gemini_model": self.gemini_model,
+            "opencode_api_key": self.opencode_api_key,
+            "opencode_model": self.opencode_model,
+            "opencode_gateway_url": self.opencode_gateway_url,
             "default_source_lang": self.default_source_lang,
             "default_target_lang": self.default_target_lang,
             "show_ai_panel_on_start": self.show_ai_panel_on_start,
@@ -199,6 +254,9 @@ class Settings:
                 openai_base_url=data.get("openai_base_url", _DEFAULT_OPENAI_BASE_URL),
                 gemini_api_key=data.get("gemini_api_key", ""),
                 gemini_model=data.get("gemini_model", _DEFAULT_GEMINI_MODEL),
+                opencode_api_key=data.get("opencode_api_key", ""),
+                opencode_model=data.get("opencode_model", _OPENCODE_DEFAULT_MODEL),
+                opencode_gateway_url=data.get("opencode_gateway_url", _OPENCODE_GATEWAY_URL),
                 default_source_lang=data.get("default_source_lang", "pt-BR"),
                 default_target_lang=data.get("default_target_lang", "en-US"),
                 show_ai_panel_on_start=data.get("show_ai_panel_on_start", True),
@@ -332,6 +390,78 @@ def _call_openai(
         ) from exc
 
 
+def _call_opencode(
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    *,
+    gateway_url: str = _OPENCODE_GATEWAY_URL,
+    timeout: int = 60,
+) -> str:
+    """Call the OpenCode inference gateway.
+
+    Uses the same API key (``TEAMCODE_API_KEY``) that the opencode tool
+    uses internally.  The gateway is compatible with the OpenAI chat
+    completions format.
+
+    Parameters
+    ----------
+    api_key : str
+        OpenCode API key (``TEAMCODE_API_KEY``).
+    model : str
+        Model name (e.g. ``opencode/deepseek-v4-flash-free``).
+    messages : list[dict]
+        Chat messages in OpenAI format.
+    gateway_url : str
+        URL of the OpenCode inference gateway.
+    timeout : int
+        Request timeout in seconds.
+
+    Returns
+    -------
+    str
+        The model's response text.
+    """
+    import httpx
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(gateway_url, headers=headers, json=payload)
+            if resp.status_code == 400:
+                # The gateway may return "Model not found" even for valid models
+                # when the account doesn't have access.  Fall back gracefully.
+                body = resp.json()
+                err = body.get("error", str(body))
+                logger.warning("OpenCode gateway error: %s", err)
+                raise RuntimeError(
+                    f"OpenCode: {err}. "
+                    f"Verifique se o modelo '{model}' está disponível na sua conta."
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+    except httpx.HTTPStatusError as exc:
+        logger.error("OpenCode HTTP error: %s", exc)
+        raise RuntimeError(
+            f"OpenCode retornou erro {exc.response.status_code}"
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.error("OpenCode connection error: %s", exc)
+        raise RuntimeError(
+            "Não foi possível conectar ao gateway OpenCode. "
+            "Verifique sua conexão com a internet."
+        ) from exc
+
+
 def _call_gemini(
     api_key: str,
     model: str,
@@ -410,6 +540,49 @@ def _call_gemini(
         ) from exc
 
 
+def get_free_models(provider: AIProvider) -> list[str]:
+    """Return a list of known free/cheap models for the given provider.
+
+    Parameters
+    ----------
+    provider : AIProvider
+        The provider to get free models for.
+
+    Returns
+    -------
+    list[str]
+        List of model IDs that are free or have a free tier.
+    """
+    models: dict[AIProvider, list[str]] = {
+        AIProvider.OLLAMA: [
+            "llama3.2",
+            "llama3.1",
+            "mistral",
+            "qwen2.5",
+            "phi3",
+            "gemma2",
+        ],
+        AIProvider.OPENAI: [
+            *(["gpt-4o-mini", "gpt-4.1-nano", "gpt-4.1-mini"]
+              if _DEFAULT_OPENAI_BASE_URL in os.environ.get("OPENAI_BASE_URL", "")
+              else _OPENROUTER_FREE_MODELS),
+        ],
+        AIProvider.GEMINI: [
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+        ],
+        AIProvider.OPENCODE: _OPENCODE_FREE_MODELS,
+    }
+    return models.get(provider, [])
+
+
+def get_preferred_free_model(provider: AIProvider) -> str:
+    """Return the best free model for the given provider."""
+    models = get_free_models(provider)
+    return models[0] if models else _DEFAULT_OPENAI_MODEL
+
+
 # ===================================================================
 #  Chat helper
 # ===================================================================
@@ -445,6 +618,11 @@ def _chat_completion(
         )
     elif provider == AIProvider.GEMINI:
         return _call_gemini(settings.gemini_api_key, settings.gemini_model, messages, timeout=timeout)
+    elif provider == AIProvider.OPENCODE:
+        return _call_opencode(
+            settings.opencode_api_key, settings.opencode_model, messages,
+            gateway_url=settings.opencode_gateway_url, timeout=timeout,
+        )
     else:
         raise ValueError(f"Unknown AI provider: {provider}")
 
